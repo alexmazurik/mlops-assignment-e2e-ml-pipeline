@@ -7,6 +7,9 @@ __pycache__
 /trajectory.json
 
 /logs/
+/runs/
+/mlruns/
+/mlflow/
 
 mini-swe-agent/
 SWE-bench/

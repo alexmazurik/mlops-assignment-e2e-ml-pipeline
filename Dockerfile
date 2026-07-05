@@ -18,7 +18,10 @@ RUN uv sync --locked
 
 ENV PATH="/mlops-assignment/.venv/bin:$PATH"
 
+COPY dags dags/
 COPY scripts scripts/
+COPY run-airflow-standalone.sh .
+COPY README.md .
 
 # Optional but useful if your script lacks executable bit or shebang issues:
-RUN chmod +x scripts/*.sh
+RUN chmod +x scripts/*.sh run-airflow-standalone.sh
