@@ -22,6 +22,7 @@ RUNS_ROOT = PROJECT_ROOT / "runs"
 DEFAULT_MODEL = "nebius/moonshotai/Kimi-K2.6"
 DEFAULT_EXPERIMENT_NAME = "swe-bench-agent-evals"
 DEFAULT_MLFLOW_TRACKING_URI = "http://localhost:5018"
+DEFAULT_STEP_LIMIT = 30
 
 
 def _utc_now() -> str:
@@ -80,6 +81,7 @@ def build_run_config(params: dict[str, Any], airflow_run_id: str | None = None) 
     model = str(params.get("model") or DEFAULT_MODEL)
     task_slice = str(params.get("task_slice") or "").strip()
     workers = int(params.get("workers") or 1)
+    step_limit = int(params.get("step_limit") or DEFAULT_STEP_LIMIT)
     cost_limit_raw = params.get("cost_limit", 0)
     cost_limit = None if cost_limit_raw in (None, "") else float(cost_limit_raw)
     mini_swe_config = str(params.get("mini_swe_config") or "").strip()
@@ -92,6 +94,7 @@ def build_run_config(params: dict[str, Any], airflow_run_id: str | None = None) 
         "subset": subset,
         "dataset_name": str(params.get("dataset_name") or _dataset_name(subset)),
         "workers": workers,
+        "step_limit": step_limit,
         "model": model,
         "task_slice": task_slice,
         "cost_limit": cost_limit,
@@ -180,8 +183,10 @@ def run_agent_batch(run_config: dict[str, Any], run_dir: str) -> str:
     ]
     if run_config.get("task_slice"):
         command.extend(["--slice", str(run_config["task_slice"])])
+    command.extend(["--config", "swebench.yaml"])
     if run_config.get("mini_swe_config"):
         command.extend(["--config", str(run_config["mini_swe_config"])])
+    command.extend(["--config", f"agent.step_limit={run_config['step_limit']}"])
 
     _run_command(
         command,
@@ -197,6 +202,27 @@ def run_agent_batch(run_config: dict[str, Any], run_dir: str) -> str:
         raise FileNotFoundError(f"mini-swe-agent did not produce {produced_preds}")
     shutil.copy2(produced_preds, stable_preds)
     predictions = _read_json(stable_preds)
+    if not predictions:
+        raise RuntimeError(f"mini-swe-agent produced no predictions in {stable_preds}")
+
+    missing_trajectories = [
+        instance_id
+        for instance_id in predictions
+        if not (trajectories_dir / instance_id / f"{instance_id}.traj.json").exists()
+    ]
+    if missing_trajectories:
+        raise RuntimeError(
+            "mini-swe-agent did not produce trajectory files for "
+            f"{len(missing_trajectories)} instance(s): {', '.join(sorted(missing_trajectories))}. "
+            f"Check {run_path / 'run-agent' / 'mini-swe-agent.log'}"
+        )
+
+    if all(not prediction.get("model_patch") for prediction in predictions.values()):
+        raise RuntimeError(
+            "mini-swe-agent produced only empty patches. "
+            f"Check {run_path / 'run-agent' / 'mini-swe-agent.log'}"
+        )
+
     _write_json(
         run_path / "run-agent" / "instances.json",
         {
@@ -447,6 +473,7 @@ def write_manifest(
         "split": Param("test", type="string"),
         "subset": Param("verified", type="string"),
         "workers": Param(5, type="integer", minimum=1),
+        "step_limit": Param(DEFAULT_STEP_LIMIT, type="integer", minimum=1),
         "model": Param(DEFAULT_MODEL, type="string"),
         "task_slice": Param("0:3", type=["string", "null"]),
         "run_id": Param("", type=["string", "null"]),

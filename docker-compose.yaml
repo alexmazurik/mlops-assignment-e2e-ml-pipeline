@@ -38,13 +38,14 @@ services:
       MLFLOW_TRACKING_URI: http://mlflow:5018
       MLFLOW_EXPERIMENT_NAME: swe-bench-agent-evals
       MSWEA_COST_TRACKING: ignore_errors
+      DOCKER_HOST: unix:///var/run/docker.sock
       NEBIUS_API_KEY: ${NEBIUS_API_KEY:-}
     ports:
       - "8080:8080"
     volumes:
       - .:/mlops-assignment
       - airflow-home:/airflow
-      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/run/docker_socket/docker.sock:/var/run/docker.sock
 
 volumes:
   airflow-home:
