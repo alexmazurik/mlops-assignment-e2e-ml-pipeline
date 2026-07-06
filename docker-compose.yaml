@@ -1,0 +1,45 @@
+services:
+  mlflow:
+    build: .
+    command:
+      - uv
+      - tool
+      - run
+      - mlflow
+      - server
+      - --host
+      - 0.0.0.0
+      - --port
+      - "5000"
+      - --backend-store-uri
+      - sqlite:////mlflow/mlflow.db
+      - --default-artifact-root
+      - /mlflow/artifacts
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow-data:/mlflow
+
+  airflow:
+    build: .
+    command: ["bash", "run-airflow-standalone.sh"]
+    depends_on:
+      - mlflow
+    environment:
+      AIRFLOW_HOME: /airflow
+      AIRFLOW__CORE__DAGS_FOLDER: /mlops-assignment/dags
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_EXPERIMENT_NAME: swe-bench-agent-evals
+      MSWEA_COST_TRACKING: ignore_errors
+      NEBIUS_API_KEY: ${NEBIUS_API_KEY:-}
+    ports:
+      - "8080:8080"
+    volumes:
+      - .:/mlops-assignment
+      - airflow-home:/airflow
+      - /var/run/docker.sock:/var/run/docker.sock
+
+volumes:
+  airflow-home:
+  mlflow-data:
