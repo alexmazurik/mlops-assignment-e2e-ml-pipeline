@@ -27,7 +27,7 @@ Useful optional params:
 - `cost_limit`: mini-swe-agent global cost limit, exported as `MSWEA_GLOBAL_COST_LIMIT`.
 - `dataset_name`: override the SWE-bench dataset name. By default it is derived from `subset`.
 - `mini_swe_config`: optional path to a mini-swe-agent SWE-bench config.
-- `mlflow_tracking_uri`: MLflow server URL. In compose this is `http://mlflow:5000`.
+- `mlflow_tracking_uri`: MLflow server URL. In compose this is `http://mlflow:5018`.
 
 ## Artifact Layout
 
@@ -84,9 +84,9 @@ docker compose up --build
 Then open:
 
 - Airflow: `http://localhost:8080`
-- MLflow: `http://localhost:5000`
+- MLflow: `http://localhost:5018`
 
-Compose passes `MLFLOW_TRACKING_URI=http://mlflow:5000` to Airflow, so completed DAG runs are logged to the `swe-bench-agent-evals` MLflow experiment.
+Compose passes `MLFLOW_TRACKING_URI=http://mlflow:5018` to Airflow, so completed DAG runs are logged to the `swe-bench-agent-evals` MLflow experiment.
 
 ## Completed Smoke Run
 

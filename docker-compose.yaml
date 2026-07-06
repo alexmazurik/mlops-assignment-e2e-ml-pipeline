@@ -5,18 +5,24 @@ services:
       - uv
       - tool
       - run
+      - --python
+      - "3.12"
       - mlflow
       - server
       - --host
       - 0.0.0.0
       - --port
-      - "5000"
+      - "5018"
       - --backend-store-uri
       - sqlite:////mlflow/mlflow.db
       - --default-artifact-root
       - /mlflow/artifacts
+      - --allowed-hosts
+      - localhost,localhost:5018,127.0.0.1,127.0.0.1:5018,mlflow,mlflow:5018
+      - --cors-allowed-origins
+      - http://localhost:5018,http://127.0.0.1:5018
     ports:
-      - "5000:5000"
+      - "5018:5018"
     volumes:
       - mlflow-data:/mlflow
 
@@ -29,7 +35,7 @@ services:
       AIRFLOW_HOME: /airflow
       AIRFLOW__CORE__DAGS_FOLDER: /mlops-assignment/dags
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
-      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_TRACKING_URI: http://mlflow:5018
       MLFLOW_EXPERIMENT_NAME: swe-bench-agent-evals
       MSWEA_COST_TRACKING: ignore_errors
       NEBIUS_API_KEY: ${NEBIUS_API_KEY:-}

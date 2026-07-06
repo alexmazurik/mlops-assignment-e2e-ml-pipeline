@@ -21,6 +21,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RUNS_ROOT = PROJECT_ROOT / "runs"
 DEFAULT_MODEL = "nebius/moonshotai/Kimi-K2.6"
 DEFAULT_EXPERIMENT_NAME = "swe-bench-agent-evals"
+DEFAULT_MLFLOW_TRACKING_URI = "http://localhost:5018"
 
 
 def _utc_now() -> str:
@@ -71,6 +72,7 @@ def _dataset_name(subset: str) -> str:
 
 
 def build_run_config(params: dict[str, Any], airflow_run_id: str | None = None) -> dict[str, Any]:
+    env = {**_load_dotenv(PROJECT_ROOT / ".env"), **os.environ}
     run_id_param = str(params.get("run_id") or "").strip()
     run_id = _sanitized_run_id(run_id_param or airflow_run_id)
     subset = str(params.get("subset") or "verified")
@@ -96,12 +98,12 @@ def build_run_config(params: dict[str, Any], airflow_run_id: str | None = None) 
         "mini_swe_config": mini_swe_config,
         "mlflow_tracking_uri": str(
             params.get("mlflow_tracking_uri")
-            or os.environ.get("MLFLOW_TRACKING_URI")
-            or ""
+            or env.get("MLFLOW_TRACKING_URI")
+            or DEFAULT_MLFLOW_TRACKING_URI
         ),
         "mlflow_experiment_name": str(
             params.get("mlflow_experiment_name")
-            or os.environ.get("MLFLOW_EXPERIMENT_NAME")
+            or env.get("MLFLOW_EXPERIMENT_NAME")
             or DEFAULT_EXPERIMENT_NAME
         ),
     }
@@ -339,7 +341,8 @@ def _mlflow_get_or_create_experiment(tracking_uri: str, experiment_name: str) ->
 
 
 def log_mlflow_run(run_config: dict[str, Any], metrics: dict[str, Any], artifact_uri: str) -> dict[str, Any]:
-    tracking_uri = run_config.get("mlflow_tracking_uri") or os.environ.get("MLFLOW_TRACKING_URI")
+    env = {**_load_dotenv(PROJECT_ROOT / ".env"), **os.environ}
+    tracking_uri = run_config.get("mlflow_tracking_uri") or env.get("MLFLOW_TRACKING_URI") or DEFAULT_MLFLOW_TRACKING_URI
     if not tracking_uri:
         return {"status": "skipped", "reason": "MLFLOW_TRACKING_URI is not configured"}
     if not tracking_uri.startswith(("http://", "https://")):
@@ -385,7 +388,7 @@ def log_mlflow_run(run_config: dict[str, Any], metrics: dict[str, Any], artifact
     )
     _mlflow_http_request(
         tracking_uri,
-        "/api/2.0/mlflow/runs/set-terminated",
+        "/api/2.0/mlflow/runs/update",
         {"run_id": mlflow_run_id, "status": "FINISHED", "end_time": int(time.time() * 1000)},
     )
     return {
