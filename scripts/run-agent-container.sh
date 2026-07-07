@@ -115,15 +115,16 @@ if missing:
         f"{len(missing)} instance(s): {', '.join(sorted(missing))}. Check {log_path}"
     )
 
-if all(not prediction.get("model_patch") for prediction in predictions.values()):
-    raise SystemExit(f"mini-swe-agent produced only empty patches. Check {log_path}")
+empty_patch_count = sum(1 for prediction in predictions.values() if not prediction.get("model_patch"))
 
 instances_path.write_text(
     json.dumps(
         {
             "count": len(predictions),
+            "empty_patch_count": empty_patch_count,
             "instance_ids": sorted(predictions),
             "source": str(preds_path),
+            "warning": "all predictions have empty patches" if empty_patch_count == len(predictions) else "",
         },
         indent=2,
         sort_keys=True,

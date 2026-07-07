@@ -92,9 +92,9 @@ Then open:
 
 Compose passes `MLFLOW_TRACKING_URI=http://mlflow:5018` to Airflow, so completed DAG runs are logged to the `swe-bench-agent-evals` MLflow experiment.
 
-DockerOperator also needs host-level mount settings. The provided `.env.example` includes:
+DockerOperator also needs host-level mount settings. By default `docker-compose.yaml` uses `${PWD}` as `HOST_PROJECT_ROOT`, so a fresh clone or copied checkout mounts its own directory into DockerOperator task containers. The provided `.env.example` documents optional overrides:
 
-- `EXECUTION_IMAGE`: image used by DockerOperator, normally `my_fork-airflow:latest`.
+- `EXECUTION_IMAGE`: image used by DockerOperator, normally `swe-bench-agent-airflow:latest`.
 - `HOST_PROJECT_ROOT`: host path for this checkout, mounted into task containers as `/mlops-assignment`.
 - `HOST_DOCKER_SOCKET`: host Docker socket path mounted into task containers as `/var/run/docker.sock`.
 

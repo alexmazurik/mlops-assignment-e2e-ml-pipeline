@@ -18,7 +18,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 def my_dag():
     DockerOperator(
         task_id="run_single_instance",
-        image=os.environ.get("EXECUTION_IMAGE", "my_fork-airflow:latest"),
+        image=os.environ.get("EXECUTION_IMAGE", "swe-bench-agent-airflow:latest"),
         command=[
             "uv",
             "run",
