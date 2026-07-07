@@ -31,6 +31,7 @@ services:
     command: ["bash", "run-airflow-standalone.sh"]
     depends_on:
       - mlflow
+      - minio
     environment:
       AIRFLOW_HOME: /airflow
       AIRFLOW__CORE__DAGS_FOLDER: /mlops-assignment/dags
@@ -39,6 +40,12 @@ services:
       MLFLOW_EXPERIMENT_NAME: swe-bench-agent-evals
       MSWEA_COST_TRACKING: ignore_errors
       DOCKER_HOST: unix:///var/run/docker.sock
+      S3_ARTIFACT_URI: s3://mlops-runs/swe-bench-runs/
+      AWS_ENDPOINT_URL_S3: http://minio:9000
+      MINIO_BROWSER_URI: http://localhost:9001
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_DEFAULT_REGION: us-east-1
       NEBIUS_API_KEY: ${NEBIUS_API_KEY:-}
     ports:
       - "8080:8080"
@@ -47,6 +54,19 @@ services:
       - airflow-home:/airflow
       - /var/run/docker_socket/docker.sock:/var/run/docker.sock
 
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+
 volumes:
   airflow-home:
   mlflow-data:
+  minio-data:

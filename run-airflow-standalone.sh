@@ -11,4 +11,4 @@ mkdir -p "$AIRFLOW_HOME"
 
 echo '{"admin": "admin"}' > "$AIRFLOW_HOME/simple_auth_manager_passwords.json.generated"
 
-uv tool run apache-airflow standalone
+uv tool run --python 3.12 --with boto3 apache-airflow standalone

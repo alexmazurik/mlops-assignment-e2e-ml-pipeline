@@ -23,6 +23,8 @@ DEFAULT_MODEL = "nebius/moonshotai/Kimi-K2.6"
 DEFAULT_EXPERIMENT_NAME = "swe-bench-agent-evals"
 DEFAULT_MLFLOW_TRACKING_URI = "http://localhost:5018"
 DEFAULT_STEP_LIMIT = 30
+DEFAULT_S3_ARTIFACT_URI = "s3://mlops-runs/swe-bench-runs/"
+DEFAULT_MINIO_BROWSER_URI = "http://localhost:9001"
 
 
 def _utc_now() -> str:
@@ -85,6 +87,18 @@ def build_run_config(params: dict[str, Any], airflow_run_id: str | None = None) 
     cost_limit_raw = params.get("cost_limit", 0)
     cost_limit = None if cost_limit_raw in (None, "") else float(cost_limit_raw)
     mini_swe_config = str(params.get("mini_swe_config") or "").strip()
+    s3_artifact_uri = str(params.get("s3_artifact_uri") or env.get("S3_ARTIFACT_URI") or "").strip()
+    s3_endpoint_url = str(
+        params.get("s3_endpoint_url")
+        or env.get("AWS_ENDPOINT_URL_S3")
+        or env.get("S3_ENDPOINT_URL")
+        or ""
+    ).strip()
+    minio_browser_uri = str(
+        params.get("minio_browser_uri")
+        or env.get("MINIO_BROWSER_URI")
+        or DEFAULT_MINIO_BROWSER_URI
+    ).strip()
 
     return {
         "run_id": run_id,
@@ -99,6 +113,9 @@ def build_run_config(params: dict[str, Any], airflow_run_id: str | None = None) 
         "task_slice": task_slice,
         "cost_limit": cost_limit,
         "mini_swe_config": mini_swe_config,
+        "s3_artifact_uri": s3_artifact_uri,
+        "s3_endpoint_url": s3_endpoint_url,
+        "minio_browser_uri": minio_browser_uri,
         "mlflow_tracking_uri": str(
             params.get("mlflow_tracking_uri")
             or env.get("MLFLOW_TRACKING_URI")
@@ -323,6 +340,77 @@ def collect_metrics(eval_dir: str, preds_path: str) -> dict[str, Any]:
     }
 
 
+def _parse_s3_uri(uri: str) -> tuple[str, str]:
+    parsed = urllib.parse.urlparse(uri)
+    if parsed.scheme != "s3" or not parsed.netloc:
+        raise ValueError(f"Expected an s3://bucket/prefix URI, got {uri!r}")
+    return parsed.netloc, parsed.path.lstrip("/")
+
+
+def _s3_client(run_config: dict[str, Any]):
+    import boto3
+    from botocore.config import Config
+
+    env = {**_load_dotenv(PROJECT_ROOT / ".env"), **os.environ}
+    endpoint_url = (
+        run_config.get("s3_endpoint_url")
+        or env.get("AWS_ENDPOINT_URL_S3")
+        or env.get("S3_ENDPOINT_URL")
+    )
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint_url or None,
+        region_name=env.get("AWS_DEFAULT_REGION", "us-east-1"),
+        aws_access_key_id=env.get("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=env.get("AWS_SECRET_ACCESS_KEY"),
+        config=Config(s3={"addressing_style": "path"}),
+    )
+
+
+def _ensure_s3_bucket(client: Any, bucket: str) -> None:
+    try:
+        client.head_bucket(Bucket=bucket)
+    except Exception:
+        client.create_bucket(Bucket=bucket)
+
+
+def _upload_file_to_s3(run_config: dict[str, Any], local_path: Path, artifact_uri: str) -> str:
+    bucket, key = _parse_s3_uri(artifact_uri)
+    client = _s3_client(run_config)
+    _ensure_s3_bucket(client, bucket)
+    client.upload_file(str(local_path), bucket, key)
+    return artifact_uri
+
+
+def upload_run_artifacts(run_config: dict[str, Any], run_dir: str) -> str | None:
+    base_uri = str(run_config.get("s3_artifact_uri") or "").strip().rstrip("/")
+    if not base_uri:
+        return None
+
+    run_path = Path(run_dir)
+    bucket, prefix = _parse_s3_uri(base_uri)
+    run_prefix = "/".join(part for part in [prefix, run_config["run_id"]] if part)
+    client = _s3_client(run_config)
+    _ensure_s3_bucket(client, bucket)
+
+    for path in sorted(run_path.rglob("*")):
+        if not path.is_file():
+            continue
+        key = f"{run_prefix}/{path.relative_to(run_path).as_posix()}"
+        client.upload_file(str(path), bucket, key)
+
+    return f"s3://{bucket}/{run_prefix}/"
+
+
+def minio_artifact_uri(run_config: dict[str, Any], artifact_uri: str) -> str | None:
+    if not artifact_uri.startswith("s3://"):
+        return None
+    bucket, prefix = _parse_s3_uri(artifact_uri)
+    browser_uri = str(run_config.get("minio_browser_uri") or DEFAULT_MINIO_BROWSER_URI).rstrip("/")
+    encoded_prefix = urllib.parse.quote(prefix, safe="")
+    return f"{browser_uri}/browser/{bucket}/{encoded_prefix}"
+
+
 def _mlflow_http_request(tracking_uri: str, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
     url = tracking_uri.rstrip("/") + endpoint
     data = json.dumps(payload).encode("utf-8")
@@ -366,7 +454,12 @@ def _mlflow_get_or_create_experiment(tracking_uri: str, experiment_name: str) ->
     return str(response["experiment_id"])
 
 
-def log_mlflow_run(run_config: dict[str, Any], metrics: dict[str, Any], artifact_uri: str) -> dict[str, Any]:
+def log_mlflow_run(
+    run_config: dict[str, Any],
+    metrics: dict[str, Any],
+    artifact_uri: str,
+    minio_uri: str | None = None,
+) -> dict[str, Any]:
     env = {**_load_dotenv(PROJECT_ROOT / ".env"), **os.environ}
     tracking_uri = run_config.get("mlflow_tracking_uri") or env.get("MLFLOW_TRACKING_URI") or DEFAULT_MLFLOW_TRACKING_URI
     if not tracking_uri:
@@ -392,6 +485,7 @@ def log_mlflow_run(run_config: dict[str, Any], metrics: dict[str, Any], artifact
             "tags": [
                 {"key": "mlflow.runName", "value": run_config["run_id"]},
                 {"key": "artifact_uri", "value": artifact_uri},
+                {"key": "minio_artifact_uri", "value": minio_uri or ""},
             ],
         },
     )
@@ -402,6 +496,8 @@ def log_mlflow_run(run_config: dict[str, Any], metrics: dict[str, Any], artifact
         if isinstance(value, str | int | float | bool) or value is None
     ]
     params.append({"key": "artifact_uri", "value": artifact_uri})
+    if minio_uri:
+        params.append({"key": "minio_artifact_uri", "value": minio_uri})
     numeric_metrics = [
         {"key": key, "value": float(value), "timestamp": timestamp_ms, "step": 0}
         for key, value in metrics.items()
@@ -432,6 +528,8 @@ def write_manifest(
     eval_dir: str,
     metrics: dict[str, Any],
     mlflow_status: dict[str, Any],
+    artifact_uri: str,
+    minio_uri: str | None,
 ) -> str:
     run_path = Path(run_dir)
     metrics_path = run_path / "metrics.json"
@@ -440,7 +538,9 @@ def write_manifest(
         "run_id": run_config["run_id"],
         "created_at": run_config["created_at"],
         "updated_at": _utc_now(),
-        "artifact_uri": str(run_path.resolve()),
+        "artifact_uri": artifact_uri,
+        "minio_artifact_uri": minio_uri,
+        "local_artifact_uri": str(run_path.resolve()),
         "config": "config.json",
         "run_agent": {
             "predictions": str(Path(preds_path).relative_to(run_path)),
@@ -480,6 +580,9 @@ def write_manifest(
         "cost_limit": Param(0.0, type=["number", "null"]),
         "dataset_name": Param("", type=["string", "null"]),
         "mini_swe_config": Param("", type=["string", "null"]),
+        "s3_artifact_uri": Param(DEFAULT_S3_ARTIFACT_URI, type=["string", "null"]),
+        "s3_endpoint_url": Param("", type=["string", "null"]),
+        "minio_browser_uri": Param(DEFAULT_MINIO_BROWSER_URI, type=["string", "null"]),
         "mlflow_tracking_uri": Param("", type=["string", "null"]),
         "mlflow_experiment_name": Param(DEFAULT_EXPERIMENT_NAME, type="string"),
     },
@@ -508,9 +611,25 @@ def evaluate_agent_dag() -> None:
     @task
     def summarize_and_log(run_config: dict[str, Any], preds_path: str, eval_dir: str) -> str:
         metrics = collect_metrics(eval_dir, preds_path)
-        artifact_uri = str(Path(run_config["run_dir"]).resolve())
-        mlflow_status = log_mlflow_run(run_config, metrics, artifact_uri)
-        return write_manifest(run_config, run_config["run_dir"], preds_path, eval_dir, metrics, mlflow_status)
+        run_path = Path(run_config["run_dir"])
+        _write_json(run_path / "metrics.json", metrics)
+        artifact_uri = upload_run_artifacts(run_config, run_config["run_dir"]) or str(run_path.resolve())
+        minio_uri = minio_artifact_uri(run_config, artifact_uri)
+        mlflow_status = log_mlflow_run(run_config, metrics, artifact_uri, minio_uri)
+        manifest_path = write_manifest(
+            run_config,
+            run_config["run_dir"],
+            preds_path,
+            eval_dir,
+            metrics,
+            mlflow_status,
+            artifact_uri,
+            minio_uri,
+        )
+        if artifact_uri.startswith("s3://"):
+            manifest_uri = artifact_uri.rstrip("/") + "/manifest.json"
+            _upload_file_to_s3(run_config, Path(manifest_path), manifest_uri)
+        return manifest_path
 
     config = cast(dict[str, Any], prepare_run())
     predictions = cast(str, run_agent(config))
