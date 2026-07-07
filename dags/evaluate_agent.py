@@ -3,18 +3,17 @@ from __future__ import annotations
 import json
 import os
 import re
-import shlex
-import shutil
-import subprocess
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Callable, TypeVar, cast
 
 from airflow.sdk import Param, dag, get_current_context, task
+from airflow.providers.docker.operators.docker import DockerOperator
+from docker.types import Mount
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -25,6 +24,14 @@ DEFAULT_MLFLOW_TRACKING_URI = "http://localhost:5018"
 DEFAULT_STEP_LIMIT = 30
 DEFAULT_S3_ARTIFACT_URI = "s3://mlops-runs/swe-bench-runs/"
 DEFAULT_MINIO_BROWSER_URI = "http://localhost:9001"
+DEFAULT_EXECUTION_IMAGE = "my_fork-airflow:latest"
+DEFAULT_AGENT_TIMEOUT_HOURS = 8
+DEFAULT_EVAL_TIMEOUT_HOURS = 8
+DEFAULT_SUMMARY_TIMEOUT_MINUTES = 20
+NETWORK_RETRY_ATTEMPTS = 3
+NETWORK_RETRY_DELAY_SECONDS = 5
+
+T = TypeVar("T")
 
 
 def _utc_now() -> str:
@@ -44,6 +51,23 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
 
 def _read_json(path: Path) -> Any:
     return json.loads(path.read_text())
+
+
+def _with_network_retries(operation: Callable[[], T]) -> T:
+    last_error: Exception | None = None
+    for attempt in range(1, NETWORK_RETRY_ATTEMPTS + 1):
+        try:
+            return operation()
+        except urllib.error.HTTPError as error:
+            if error.code < 500:
+                raise
+            last_error = error
+        except (urllib.error.URLError, TimeoutError, OSError) as error:
+            last_error = error
+        if attempt < NETWORK_RETRY_ATTEMPTS:
+            time.sleep(NETWORK_RETRY_DELAY_SECONDS * attempt)
+    assert last_error is not None
+    raise last_error
 
 
 def _load_dotenv(path: Path) -> dict[str, str]:
@@ -138,155 +162,50 @@ def prepare_run_dir(run_config: dict[str, Any]) -> str:
     return str(run_dir)
 
 
-def _command_env(run_config: dict[str, Any] | None = None) -> dict[str, str]:
-    env = {**os.environ, **_load_dotenv(PROJECT_ROOT / ".env")}
-    env.setdefault("MSWEA_COST_TRACKING", "ignore_errors")
-    if run_config and run_config.get("cost_limit") is not None:
-        env["MSWEA_GLOBAL_COST_LIMIT"] = str(run_config["cost_limit"])
-    return env
+def _execution_image() -> str:
+    return os.environ.get("EXECUTION_IMAGE", DEFAULT_EXECUTION_IMAGE)
 
 
-def _run_command(
-    command: list[str],
-    *,
-    cwd: Path,
-    log_path: Path,
-    metadata_path: Path,
-    env: dict[str, str] | None = None,
-) -> None:
-    started_at = _utc_now()
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    metadata = {
-        "command": command,
-        "cwd": str(cwd),
-        "started_at": started_at,
-        "log_path": str(log_path),
+def _docker_network_mode() -> str | None:
+    value = os.environ.get("DOCKER_OPERATOR_NETWORK_MODE", "").strip()
+    return value or None
+
+
+def _docker_mounts() -> list[Mount]:
+    host_project_root = os.environ.get("HOST_PROJECT_ROOT", str(PROJECT_ROOT))
+    host_docker_socket = os.environ.get("HOST_DOCKER_SOCKET", "/var/run/docker.sock")
+    return [
+        Mount(source=host_project_root, target="/mlops-assignment", type="bind"),
+        Mount(source=host_docker_socket, target="/var/run/docker.sock", type="bind"),
+    ]
+
+
+def _xcom_config(key: str) -> str:
+    return "{{ ti.xcom_pull(task_ids='prepare_run')['" + key + "'] }}"
+
+
+def _container_environment() -> dict[str, str]:
+    return {
+        "PROJECT_ROOT": "/mlops-assignment",
+        "RUN_ID": _xcom_config("run_id"),
+        "RUN_DIR": _xcom_config("run_dir"),
+        "SWE_BENCH_SUBSET": _xcom_config("subset"),
+        "SWE_BENCH_SPLIT": _xcom_config("split"),
+        "SWE_BENCH_DATASET": _xcom_config("dataset_name"),
+        "SWE_BENCH_WORKERS": _xcom_config("workers"),
+        "SWE_BENCH_TASK_SLICE": _xcom_config("task_slice"),
+        "MINI_SWE_MODEL": _xcom_config("model"),
+        "MINI_SWE_STEP_LIMIT": _xcom_config("step_limit"),
+        "MINI_SWE_CONFIG": _xcom_config("mini_swe_config"),
+        "SWE_BENCH_PREDS": "{{ ti.xcom_pull(task_ids='prepare_run')['run_dir'] }}/run-agent/preds.json",
+        "MSWEA_COST_TRACKING": os.environ.get("MSWEA_COST_TRACKING", "ignore_errors"),
+        "MSWEA_GLOBAL_COST_LIMIT": (
+            "{{ '' if ti.xcom_pull(task_ids='prepare_run')['cost_limit'] is none "
+            "else ti.xcom_pull(task_ids='prepare_run')['cost_limit'] }}"
+        ),
+        "NEBIUS_API_KEY": os.environ.get("NEBIUS_API_KEY", ""),
+        "SCRIPT_EXT": "sh",
     }
-    with log_path.open("w") as log_file:
-        log_file.write(f"$ {shlex.join(command)}\n\n")
-        log_file.flush()
-        completed = subprocess.run(
-            command,
-            cwd=cwd,
-            env=env,
-            stdout=log_file,
-            stderr=log_file,
-            check=False,
-        )
-    metadata.update({"finished_at": _utc_now(), "returncode": completed.returncode})
-    _write_json(metadata_path, metadata)
-    if completed.returncode != 0:
-        raise subprocess.CalledProcessError(completed.returncode, command)
-
-
-def run_agent_batch(run_config: dict[str, Any], run_dir: str) -> str:
-    run_path = Path(run_dir)
-    trajectories_dir = run_path / "run-agent" / "trajectories"
-    command = [
-        "uv",
-        "run",
-        "mini-extra",
-        "swebench",
-        "--subset",
-        run_config["subset"],
-        "--split",
-        run_config["split"],
-        "--model",
-        run_config["model"],
-        "--workers",
-        str(run_config["workers"]),
-        "-o",
-        str(trajectories_dir),
-    ]
-    if run_config.get("task_slice"):
-        command.extend(["--slice", str(run_config["task_slice"])])
-    command.extend(["--config", "swebench.yaml"])
-    if run_config.get("mini_swe_config"):
-        command.extend(["--config", str(run_config["mini_swe_config"])])
-    command.extend(["--config", f"agent.step_limit={run_config['step_limit']}"])
-
-    _run_command(
-        command,
-        cwd=PROJECT_ROOT,
-        env=_command_env(run_config),
-        log_path=run_path / "run-agent" / "mini-swe-agent.log",
-        metadata_path=run_path / "run-agent" / "command.json",
-    )
-
-    produced_preds = trajectories_dir / "preds.json"
-    stable_preds = run_path / "run-agent" / "preds.json"
-    if not produced_preds.exists():
-        raise FileNotFoundError(f"mini-swe-agent did not produce {produced_preds}")
-    shutil.copy2(produced_preds, stable_preds)
-    predictions = _read_json(stable_preds)
-    if not predictions:
-        raise RuntimeError(f"mini-swe-agent produced no predictions in {stable_preds}")
-
-    missing_trajectories = [
-        instance_id
-        for instance_id in predictions
-        if not (trajectories_dir / instance_id / f"{instance_id}.traj.json").exists()
-    ]
-    if missing_trajectories:
-        raise RuntimeError(
-            "mini-swe-agent did not produce trajectory files for "
-            f"{len(missing_trajectories)} instance(s): {', '.join(sorted(missing_trajectories))}. "
-            f"Check {run_path / 'run-agent' / 'mini-swe-agent.log'}"
-        )
-
-    if all(not prediction.get("model_patch") for prediction in predictions.values()):
-        raise RuntimeError(
-            "mini-swe-agent produced only empty patches. "
-            f"Check {run_path / 'run-agent' / 'mini-swe-agent.log'}"
-        )
-
-    _write_json(
-        run_path / "run-agent" / "instances.json",
-        {
-            "count": len(predictions),
-            "instance_ids": sorted(predictions),
-            "source": str(stable_preds),
-        },
-    )
-    return str(stable_preds)
-
-
-def run_swebench_eval(run_config: dict[str, Any], preds_path: str, run_dir: str) -> str:
-    run_path = Path(run_dir)
-    eval_dir = run_path / "run-eval"
-    command = [
-        "uv",
-        "run",
-        "python",
-        "-m",
-        "swebench.harness.run_evaluation",
-        "--dataset_name",
-        run_config["dataset_name"],
-        "--split",
-        run_config["split"],
-        "--predictions_path",
-        str(Path(preds_path).resolve()),
-        "--max_workers",
-        str(run_config["workers"]),
-        "--run_id",
-        run_config["run_id"],
-    ]
-    _run_command(
-        command,
-        cwd=eval_dir,
-        env=_command_env(run_config),
-        log_path=eval_dir / "swe-bench-eval.log",
-        metadata_path=eval_dir / "command.json",
-    )
-
-    reports_dir = eval_dir / "reports"
-    for report_path in (eval_dir / "logs").glob("run_evaluation/**/*.json"):
-        if report_path.name != "report.json":
-            continue
-        report = _read_json(report_path)
-        for instance_id in report:
-            shutil.copy2(report_path, reports_dir / f"{instance_id}.report.json")
-    return str(eval_dir)
 
 
 def collect_metrics(eval_dir: str, preds_path: str) -> dict[str, Any]:
@@ -363,7 +282,12 @@ def _s3_client(run_config: dict[str, Any]):
         region_name=env.get("AWS_DEFAULT_REGION", "us-east-1"),
         aws_access_key_id=env.get("AWS_ACCESS_KEY_ID"),
         aws_secret_access_key=env.get("AWS_SECRET_ACCESS_KEY"),
-        config=Config(s3={"addressing_style": "path"}),
+        config=Config(
+            connect_timeout=10,
+            read_timeout=60,
+            retries={"max_attempts": NETWORK_RETRY_ATTEMPTS, "mode": "standard"},
+            s3={"addressing_style": "path"},
+        ),
     )
 
 
@@ -378,7 +302,7 @@ def _upload_file_to_s3(run_config: dict[str, Any], local_path: Path, artifact_ur
     bucket, key = _parse_s3_uri(artifact_uri)
     client = _s3_client(run_config)
     _ensure_s3_bucket(client, bucket)
-    client.upload_file(str(local_path), bucket, key)
+    _with_network_retries(lambda: client.upload_file(str(local_path), bucket, key))
     return artifact_uri
 
 
@@ -397,7 +321,7 @@ def upload_run_artifacts(run_config: dict[str, Any], run_dir: str) -> str | None
         if not path.is_file():
             continue
         key = f"{run_prefix}/{path.relative_to(run_path).as_posix()}"
-        client.upload_file(str(path), bucket, key)
+        _with_network_retries(lambda path=path, key=key: client.upload_file(str(path), bucket, key))
 
     return f"s3://{bucket}/{run_prefix}/"
 
@@ -420,16 +344,22 @@ def _mlflow_http_request(tracking_uri: str, endpoint: str, payload: dict[str, An
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=30) as response:
-        return json.loads(response.read().decode("utf-8") or "{}")
+    def send() -> dict[str, Any]:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.loads(response.read().decode("utf-8") or "{}")
+
+    return _with_network_retries(send)
 
 
 def _mlflow_http_get(tracking_uri: str, endpoint: str, params: dict[str, Any]) -> dict[str, Any]:
     query = urllib.parse.urlencode(params)
     url = f"{tracking_uri.rstrip('/')}{endpoint}?{query}"
     request = urllib.request.Request(url, method="GET")
-    with urllib.request.urlopen(request, timeout=30) as response:
-        return json.loads(response.read().decode("utf-8") or "{}")
+    def send() -> dict[str, Any]:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.loads(response.read().decode("utf-8") or "{}")
+
+    return _with_network_retries(send)
 
 
 def _mlflow_get_or_create_experiment(tracking_uri: str, experiment_name: str) -> str:
@@ -590,7 +520,7 @@ def write_manifest(
     tags=["swe-bench", "mini-swe-agent", "mlops"],
 )
 def evaluate_agent_dag() -> None:
-    @task
+    @task(retries=1, retry_delay=timedelta(minutes=2), execution_timeout=timedelta(minutes=5))
     def prepare_run() -> dict[str, Any]:
         context = get_current_context()
         assert 'params' in context, "Airflow context missing 'params'"
@@ -600,16 +530,10 @@ def evaluate_agent_dag() -> None:
         run_config["run_dir"] = run_dir
         return run_config
 
-    @task(execution_timeout=timedelta(hours=8))
-    def run_agent(run_config: dict[str, Any]) -> str:
-        return run_agent_batch(run_config, run_config["run_dir"])
-
-    @task(execution_timeout=timedelta(hours=8))
-    def run_eval(run_config: dict[str, Any], preds_path: str) -> str:
-        return run_swebench_eval(run_config, preds_path, run_config["run_dir"])
-
-    @task
-    def summarize_and_log(run_config: dict[str, Any], preds_path: str, eval_dir: str) -> str:
+    @task(retries=2, retry_delay=timedelta(minutes=2), execution_timeout=timedelta(minutes=DEFAULT_SUMMARY_TIMEOUT_MINUTES))
+    def summarize_and_log(run_config: dict[str, Any]) -> str:
+        preds_path = str(Path(run_config["run_dir"]) / "run-agent" / "preds.json")
+        eval_dir = str(Path(run_config["run_dir"]) / "run-eval")
         metrics = collect_metrics(eval_dir, preds_path)
         run_path = Path(run_config["run_dir"])
         _write_json(run_path / "metrics.json", metrics)
@@ -632,9 +556,39 @@ def evaluate_agent_dag() -> None:
         return manifest_path
 
     config = cast(dict[str, Any], prepare_run())
-    predictions = cast(str, run_agent(config))
-    evaluation = cast(str, run_eval(config, predictions))
-    summarize_and_log(config, predictions, evaluation)
+
+    run_agent = DockerOperator(
+        task_id="run_agent",
+        image=_execution_image(),
+        command=["bash", "-c", "exec ./scripts/run-agent-container.${SCRIPT_EXT}"],
+        working_dir="/mlops-assignment",
+        docker_url="unix://var/run/docker.sock",
+        mount_tmp_dir=False,
+        mounts=_docker_mounts(),
+        network_mode=_docker_network_mode(),
+        environment=_container_environment(),
+        retries=2,
+        retry_delay=timedelta(minutes=5),
+        execution_timeout=timedelta(hours=DEFAULT_AGENT_TIMEOUT_HOURS),
+    )
+
+    run_eval = DockerOperator(
+        task_id="run_eval",
+        image=_execution_image(),
+        command=["bash", "-c", "exec ./scripts/run-eval-container.${SCRIPT_EXT}"],
+        working_dir="/mlops-assignment",
+        docker_url="unix://var/run/docker.sock",
+        mount_tmp_dir=False,
+        mounts=_docker_mounts(),
+        network_mode=_docker_network_mode(),
+        environment=_container_environment(),
+        retries=1,
+        retry_delay=timedelta(minutes=5),
+        execution_timeout=timedelta(hours=DEFAULT_EVAL_TIMEOUT_HOURS),
+    )
+
+    summary = summarize_and_log(config)
+    config >> run_agent >> run_eval >> summary
 
 
 evaluate_agent = evaluate_agent_dag()

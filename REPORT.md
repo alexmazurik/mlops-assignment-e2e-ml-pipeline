@@ -5,11 +5,13 @@
 The main DAG is `dags/evaluate_agent.py` with four tasks:
 
 1. `prepare_run`: reads Airflow params, creates `runs/<run-id>/`, and writes `config.json`.
-2. `run_agent`: runs `uv run mini-extra swebench` with the selected SWE-bench split, subset, model, workers, task slice, and cost limit. Outputs are written under `run-agent/`.
-3. `run_eval`: runs `uv run python -m swebench.harness.run_evaluation` against `run-agent/preds.json`. Logs and reports are written under `run-eval/`.
-4. `summarize_and_log`: parses SWE-bench `report.json` files, writes `metrics.json` and `manifest.json`, and logs params/metrics plus the artifact path to MLflow.
+2. `run_agent`: uses `DockerOperator` and the project image to run `scripts/run-agent-container.sh`, which executes `uv run mini-extra swebench` with the selected SWE-bench split, subset, model, workers, task slice, and cost limit. Outputs are written under `run-agent/`.
+3. `run_eval`: uses `DockerOperator` and the project image to run `scripts/run-eval-container.sh`, which executes `uv run python -m swebench.harness.run_evaluation` against `run-agent/preds.json`. Logs and reports are written under `run-eval/`.
+4. `summarize_and_log`: parses SWE-bench `report.json` files, writes `metrics.json` and `manifest.json`, uploads artifacts to S3-compatible storage when configured, and logs params/metrics plus the artifact URI to MLflow.
 
 The DAG defaults to a small `verified`/`test` run with `task_slice=0:3`, which is the intended smoke-test size. Larger runs can be started from the Airflow trigger form by changing the same params.
+
+The production execution path keeps the heavy agent and evaluation processes isolated from the Airflow scheduler process. The DockerOperator containers mount the repo at `/mlops-assignment` and mount the Docker socket so SWE-bench can launch its own evaluation containers.
 
 ## Airflow Parameters
 
@@ -27,6 +29,8 @@ Useful optional params:
 - `cost_limit`: mini-swe-agent global cost limit, exported as `MSWEA_GLOBAL_COST_LIMIT`.
 - `dataset_name`: override the SWE-bench dataset name. By default it is derived from `subset`.
 - `mini_swe_config`: optional path to a mini-swe-agent SWE-bench config.
+- `s3_artifact_uri`: optional `s3://bucket/prefix/` destination for run artifacts.
+- `s3_endpoint_url`: optional S3-compatible endpoint, for example MinIO.
 - `mlflow_tracking_uri`: MLflow server URL. In compose this is `http://mlflow:5018`.
 
 ## Artifact Layout
@@ -88,6 +92,14 @@ Then open:
 
 Compose passes `MLFLOW_TRACKING_URI=http://mlflow:5018` to Airflow, so completed DAG runs are logged to the `swe-bench-agent-evals` MLflow experiment.
 
+DockerOperator also needs host-level mount settings. The provided `.env.example` includes:
+
+- `EXECUTION_IMAGE`: image used by DockerOperator, normally `my_fork-airflow:latest`.
+- `HOST_PROJECT_ROOT`: host path for this checkout, mounted into task containers as `/mlops-assignment`.
+- `HOST_DOCKER_SOCKET`: host Docker socket path mounted into task containers as `/var/run/docker.sock`.
+
+The DAG sets retries and execution timeouts for each production step: `run_agent` retries twice with an 8 hour timeout, `run_eval` retries once with an 8 hour timeout, and `summarize_and_log` retries twice with a 20 minute timeout. MLflow HTTP calls and S3 uploads also use bounded network timeouts/retries.
+
 ## Completed Smoke Run
 
 I ran a real one-instance smoke test using the DAG helper functions with:
@@ -116,7 +128,7 @@ The important files are:
 - `runs/codex-smoke-20260705/metrics.json`
 - `runs/codex-smoke-20260705/manifest.json`
 
-For this direct smoke run, MLflow logging was skipped intentionally so a local MLflow server was not required. The Airflow DAG logs to MLflow when `MLFLOW_TRACKING_URI` points to a reachable server, as in the compose setup.
+For this older direct smoke run, MLflow logging was skipped intentionally so a local MLflow server was not required. The production Airflow DAG logs to MLflow when `MLFLOW_TRACKING_URI` points to a reachable server, as in the compose setup.
 
 ## Bundled Sample Summary
 
@@ -142,10 +154,10 @@ PY
 
 ## Remote Storage
 
-The current implementation writes durable local folders under `runs/<run-id>/` and logs that path to MLflow. For long-term object storage, sync the completed run folder after `summarize_and_log`, for example:
+The current implementation writes durable local folders under `runs/<run-id>/`. If `s3_artifact_uri` is configured, `summarize_and_log` uploads the run folder to S3-compatible storage and logs that URI to MLflow. In the Compose setup this points at MinIO:
 
-```bash
-aws s3 sync runs/<run-id>/ "$S3_ARTIFACT_URI/<run-id>/"
-```
+- `S3_ARTIFACT_URI=s3://mlops-runs/swe-bench-runs/`
+- `AWS_ENDPOINT_URL_S3=http://minio:9000`
+- MinIO console: `http://localhost:9001`
 
-The manifest format already has a single `artifact_uri` field, so replacing the local path with an S3 URI is the intended next production step.
+`manifest.json` records both `artifact_uri` and `minio_artifact_uri` so the same run can be reconstructed locally or inspected through the object-storage UI.

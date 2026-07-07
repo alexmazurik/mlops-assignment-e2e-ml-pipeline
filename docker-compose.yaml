@@ -40,6 +40,9 @@ services:
       MLFLOW_EXPERIMENT_NAME: swe-bench-agent-evals
       MSWEA_COST_TRACKING: ignore_errors
       DOCKER_HOST: unix:///var/run/docker.sock
+      EXECUTION_IMAGE: ${EXECUTION_IMAGE:-my_fork-airflow:latest}
+      HOST_PROJECT_ROOT: ${HOST_PROJECT_ROOT:-/workspaces/_almaz/na_ai_engineer/mlops/hw3/my_fork}
+      HOST_DOCKER_SOCKET: ${HOST_DOCKER_SOCKET:-/var/run/docker_socket/docker.sock}
       S3_ARTIFACT_URI: s3://mlops-runs/swe-bench-runs/
       AWS_ENDPOINT_URL_S3: http://minio:9000
       MINIO_BROWSER_URI: http://localhost:9001
